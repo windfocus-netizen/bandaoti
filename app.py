@@ -4,21 +4,6 @@ Stock Scanner — Streamlit Web App
 Run: streamlit run app.py
 """
 
-import sys
-import subprocess
-
-def _ensure(pkg):
-    try:
-        __import__(pkg.split("[")[0].replace("-", "_"))
-    except ImportError:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", pkg, "--break-system-packages"],
-            stdout=subprocess.DEVNULL,
-        )
-
-for _p in ["streamlit", "yfinance", "pandas", "numpy", "requests", "plotly"]:
-    _ensure(_p)
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
