@@ -114,16 +114,27 @@ def fetch_gamma_wall(symbol: str):
         if not price or price <= 0:
             return None
 
+        import math
+
+        # Direct column access (same as original fetch_options_pcr that worked)
+        call_oi_series = chain.calls["openInterest"].dropna()
+        put_oi_series  = chain.puts["openInterest"].dropna()
+
+        # PCR: use min_count=1 so all-NaN → NaN (not 0.0)
+        call_oi_total = call_oi_series.sum(min_count=1)
+        put_oi_total  = put_oi_series.sum(min_count=1)
+
+        if (math.isnan(float(call_oi_total)) or call_oi_total == 0
+                or math.isnan(float(put_oi_total))):
+            pcr = None
+        else:
+            pcr = round(float(put_oi_total) / float(call_oi_total), 3)
+
+        # Build DataFrames for chart (strike + OI only)
         calls_all = chain.calls[["strike", "openInterest"]].rename(columns={"openInterest": "call_oi"})
         puts_all  = chain.puts[["strike", "openInterest"]].rename(columns={"openInterest": "put_oi"})
 
-        # PCR from full chain (all strikes), matches original behaviour
-        call_oi_total = calls_all["call_oi"].sum()
-        put_oi_total  = puts_all["put_oi"].sum()
-        pcr = round(put_oi_total / call_oi_total, 3) if call_oi_total > 0 else None
-
         # Filter to ±25 % band for a readable chart (needs a valid price)
-        import math
         if math.isnan(price) or price <= 0:
             return None
         lo, hi = price * 0.75, price * 1.25
@@ -452,11 +463,12 @@ for sym in SYMBOLS:
                 unsafe_allow_html=True,
             )
         else:
+            msg = "无期权数据" if gw is None else "数据不足"
             st.markdown(
-                """<div style="border:1px solid #ddd; border-radius:10px;
+                f"""<div style="border:1px solid #ddd; border-radius:10px;
                     padding:14px; text-align:center; margin-top:6px; color:#aaa;">
                     <div style="font-size:11px;">期权情绪 (PCR)</div>
-                    <div style="font-size:13px; margin-top:6px;">无数据</div>
+                    <div style="font-size:13px; margin-top:6px;">{msg}</div>
                 </div>""",
                 unsafe_allow_html=True,
             )
