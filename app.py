@@ -16,19 +16,48 @@ def _ensure(pkg):
             stdout=subprocess.DEVNULL,
         )
 
-for _p in ["streamlit", "yfinance", "pandas", "numpy"]:
+for _p in ["streamlit", "yfinance", "pandas", "numpy", "requests"]:
     _ensure(_p)
 
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta
 from pandas.io.formats.style import Styler
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-SYMBOLS = ["MU", "MRVL", "WDC", "SNDK", "AMD"]
+SYMBOLS = ["MU", "MRVL", "WDC", "SNDK", "AMD", "ASML"]
+
+SEC_UA = "StockScanner windfocus@gmail.com"
+
+ITEM_DESC = {
+    "1.01": "签订重大协议",
+    "1.02": "终止重大协议",
+    "1.03": "破产或接管",
+    "1.04": "矿山安全事项",
+    "1.05": "重大网络安全事件",
+    "2.01": "完成重大资产收购或处置",
+    "2.02": "财报业绩披露",
+    "2.03": "创设直接金融义务",
+    "2.04": "触发加速或增加金融义务",
+    "2.05": "裁员或退出计划",
+    "2.06": "资产减值",
+    "3.01": "退市或转板通知",
+    "3.02": "未注册股权销售",
+    "3.03": "修改股东权利",
+    "4.01": "更换会计师",
+    "4.02": "会计师非依赖声明",
+    "5.01": "控制权变更",
+    "5.02": "高管离职或任命",
+    "5.03": "修订公司章程",
+    "5.07": "股东提名通知",
+    "7.01": "Regulation FD 信息披露",
+    "8.01": "其他重大事件",
+    "9.01": "财务报表及附件",
+}
 
 FOMC_2026 = [
     ("Jul 29–30", "2026-07-29"),
@@ -65,6 +94,30 @@ def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_options_pcr(symbol: str):
+    """Return (pcr, label, color) or (None, None, None) if no options data."""
+    try:
+        ticker = yf.Ticker(symbol)
+        expirations = ticker.options
+        if not expirations:
+            return None, None, None
+        chain = ticker.option_chain(expirations[0])
+        put_oi = chain.puts["openInterest"].sum()
+        call_oi = chain.calls["openInterest"].sum()
+        if call_oi == 0:
+            return None, None, None
+        pcr = round(put_oi / call_oi, 3)
+        if pcr > 1.2:
+            return pcr, "看跌情绪重 🔴", "#cc0000"
+        elif pcr < 0.7:
+            return pcr, "看涨情绪重 🟢", "#006600"
+        else:
+            return pcr, "情绪中性 ⚪", "#555555"
+    except Exception:
+        return None, None, None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_earnings(symbol: str):
     """Return next earnings date string or 'N/A'."""
@@ -84,6 +137,58 @@ def fetch_earnings(symbol: str):
     except Exception:
         pass
     return "N/A"
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_cik_map() -> dict:
+    """Download ticker→CIK from EDGAR (cached 1 hour)."""
+    try:
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": SEC_UA},
+            timeout=10,
+        )
+        return {v["ticker"].upper(): int(v["cik_str"]) for v in r.json().values()}
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_8k_filings(symbol: str, cik: int, days: int = 10) -> list[dict]:
+    """Return list of 8-K/6-K filings within the last `days` days."""
+    cutoff = (datetime.today() - timedelta(days=days)).date()
+    results = []
+    try:
+        r = requests.get(
+            f"https://data.sec.gov/submissions/CIK{cik:010d}.json",
+            headers={"User-Agent": SEC_UA},
+            timeout=10,
+        )
+        recent = r.json().get("filings", {}).get("recent", {})
+        forms      = recent.get("form", [])
+        dates      = recent.get("filingDate", [])
+        items_list = recent.get("items", [])
+
+        for form, date_str, raw_items in zip(forms, dates, items_list):
+            if form not in ("8-K", "8-K/A", "6-K", "6-K/A"):
+                continue
+            if datetime.strptime(date_str, "%Y-%m-%d").date() < cutoff:
+                break  # sorted descending, safe to stop
+            # parse item numbers, skip nan/empty
+            items = [
+                x.strip()
+                for x in str(raw_items).split(",")
+                if x.strip() and x.strip().lower() != "nan"
+            ]
+            results.append({
+                "symbol":  symbol,
+                "date":    date_str,
+                "form":    form,
+                "items":   items,
+            })
+    except Exception:
+        pass
+    return results
 
 
 def analyze(symbol: str):
@@ -226,6 +331,45 @@ with st.sidebar:
 st.title("📈 半导体股票扫描器")
 st.markdown(f"**扫描标的:** {' · '.join(SYMBOLS)}　　**日期:** {today}")
 
+# ── 8-K / 6-K 重大事件 ────────────────────────────────────────────────────────
+
+st.header("📋 重大事件 (8-K / 6-K) — 最近10天")
+
+with st.spinner("正在从 SEC EDGAR 抓取最新文件..."):
+    cik_map = fetch_cik_map()
+    all_filings = []
+    for sym in SYMBOLS:
+        cik = cik_map.get(sym)
+        if cik:
+            all_filings.extend(fetch_8k_filings(sym, cik, days=10))
+
+if all_filings:
+    all_filings.sort(key=lambda x: x["date"], reverse=True)
+    rows_8k = []
+    for f in all_filings:
+        if f["items"]:
+            for item in f["items"]:
+                rows_8k.append({
+                    "公司":   f["symbol"],
+                    "提交日期": f["date"],
+                    "文件类型": f["form"],
+                    "条目":   item,
+                    "说明":   ITEM_DESC.get(item, "其他事项"),
+                })
+        else:
+            rows_8k.append({
+                "公司":   f["symbol"],
+                "提交日期": f["date"],
+                "文件类型": f["form"],
+                "条目":   "—",
+                "说明":   "（条目信息不适用）",
+            })
+    st.dataframe(pd.DataFrame(rows_8k), use_container_width=True, hide_index=True)
+else:
+    st.info("过去10天内，以上股票均无 8-K / 6-K 提交记录。")
+
+st.divider()
+
 st.header("技术指标 & 60天走势")
 
 for sym in SYMBOLS:
@@ -240,9 +384,33 @@ for sym in SYMBOLS:
         st.divider()
         continue
 
-    # ── indicators table ──────────────────────────────────────────────────
-    styled = highlight_signals(scan_df)
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    # ── indicators table + options sentiment ──────────────────────────────
+    pcr_val, pcr_label, pcr_color = fetch_options_pcr(sym)
+    tbl_col, pcr_col = st.columns([8, 2])
+    with tbl_col:
+        styled = highlight_signals(scan_df)
+        st.dataframe(styled, use_container_width=True, hide_index=True)
+    with pcr_col:
+        if pcr_val is not None:
+            st.markdown(
+                f"""<div style="border:2px solid {pcr_color}; border-radius:10px;
+                    padding:14px; text-align:center; margin-top:6px;">
+                    <div style="font-size:11px; color:#888; margin-bottom:4px;">期权情绪 (PCR)</div>
+                    <div style="font-size:30px; font-weight:bold; color:{pcr_color};">{pcr_val}</div>
+                    <div style="font-size:13px; color:{pcr_color}; margin-top:4px;">{pcr_label}</div>
+                    <div style="font-size:10px; color:#aaa; margin-top:6px;">最近到期日数据</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """<div style="border:1px solid #ddd; border-radius:10px;
+                    padding:14px; text-align:center; margin-top:6px; color:#aaa;">
+                    <div style="font-size:11px;">期权情绪 (PCR)</div>
+                    <div style="font-size:13px; margin-top:6px;">无数据</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
     # ── 60-day price chart with MA reference lines ────────────────────────
     if not raw.empty and len(raw) >= 50:
