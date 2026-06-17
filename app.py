@@ -72,6 +72,16 @@ def calc_macd(series, fast=12, slow=26, signal=9):
     return macd_line, signal_line
 
 
+def calc_kdj(df, n=9, m=3):
+    low_n  = df["Low"].rolling(n, min_periods=1).min()
+    high_n = df["High"].rolling(n, min_periods=1).max()
+    rsv = (df["Close"] - low_n) / (high_n - low_n).replace(0, np.nan) * 100
+    K = rsv.ewm(com=m - 1, min_periods=1, adjust=False).mean()
+    D = K.ewm(com=m - 1, min_periods=1, adjust=False).mean()
+    J = 3 * K - 2 * D
+    return K, D, J
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
     df = yf.Ticker(symbol).history(period=period)
@@ -233,12 +243,21 @@ def analyze(symbol: str):
     if df.empty or len(df) < 50:
         return None
 
-    df = df[["Close", "Volume"]].copy()
-    df["MA20"]   = df["Close"].rolling(20).mean()
-    df["MA50"]   = df["Close"].rolling(50).mean()
-    df["RSI"]    = calc_rsi(df["Close"])
+    df = df[["Close", "High", "Low", "Volume"]].copy()
+    df["MA20"]    = df["Close"].rolling(20).mean()
+    df["MA50"]    = df["Close"].rolling(50).mean()
+    df["RSI"]     = calc_rsi(df["Close"])
     df["MACD"], df["Signal"] = calc_macd(df["Close"])
     df["VolMA20"] = df["Volume"].rolling(20).mean()
+
+    # KDJ → J值
+    df["K"], df["D"], df["J"] = calc_kdj(df)
+
+    # 布林带挤压
+    bb_mid         = df["Close"].rolling(20).mean()
+    bb_std         = df["Close"].rolling(20).std()
+    df["BB_Width"] = 4 * bb_std / bb_mid * 100          # (Upper-Lower)/Mid*100
+    df["BB_W_MA60"]= df["BB_Width"].rolling(60, min_periods=30).mean()
 
     recent = df.dropna().tail(5)
     if recent.empty:
@@ -259,8 +278,14 @@ def analyze(symbol: str):
         ma20     = row["MA20"]
         ma50     = row["MA50"]
 
+        j_val    = row["J"]
+        bb_w     = row["BB_Width"]
+        bb_avg   = row["BB_W_MA60"]
+
         vol_flag = "放量 🔥" if vol > vol_ma20 * 1.5 else "正常"
         rsi_flag = "超买 🔴" if rsi > 70 else ("超卖 🟢" if rsi < 30 else "中性")
+        j_flag   = "黄金坑 🟢" if j_val < 20 else ("超买 🔴" if j_val > 100 else "正常")
+        bb_flag  = "蓄力 🔋" if (not np.isnan(bb_avg) and bb_w < bb_avg * 0.70) else "正常"
 
         if idx >= 1:
             prev_row   = df.iloc[idx - 1]
@@ -288,6 +313,9 @@ def analyze(symbol: str):
             "MACD状态":    macd_flag,
             "MA20位置":    "上方 ▲" if price > ma20 else "下方 ▼",
             "MA50位置":    "上方 ▲" if price > ma50 else "下方 ▼",
+            "J值":         round(j_val, 1),
+            "J状态":       j_flag,
+            "BB挤压":      bb_flag,
         })
 
     return pd.DataFrame(rows)
@@ -302,6 +330,8 @@ def highlight_signals(df: pd.DataFrame) -> Styler:
         rsi_state_idx  = col_names.index("RSI状态")  if "RSI状态"  in col_names else None
         macd_state_idx = col_names.index("MACD状态") if "MACD状态" in col_names else None
         pct_idx        = col_names.index("涨跌幅%")  if "涨跌幅%"  in col_names else None
+        j_val_idx      = col_names.index("J值")      if "J值"      in col_names else None
+        bb_idx         = col_names.index("BB挤压")   if "BB挤压"   in col_names else None
 
         if rsi_state_idx is not None:
             val = str(row["RSI状态"])
@@ -324,6 +354,18 @@ def highlight_signals(df: pd.DataFrame) -> Styler:
                     styles[pct_idx] = "color: #0a0; font-weight: bold"
                 elif pct < 0:
                     styles[pct_idx] = "color: #c00; font-weight: bold"
+
+        if j_val_idx is not None:
+            j = row["J值"]
+            if isinstance(j, (int, float)):
+                if j < 20:
+                    styles[j_val_idx] = "background-color: #ccffcc; color: #060; font-weight: bold"
+                elif j > 100:
+                    styles[j_val_idx] = "background-color: #ffcccc; color: #900; font-weight: bold"
+
+        if bb_idx is not None:
+            if "蓄力" in str(row["BB挤压"]):
+                styles[bb_idx] = "background-color: #fff3cd; color: #856404; font-weight: bold"
 
         return styles
 
