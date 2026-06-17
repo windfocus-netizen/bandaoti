@@ -16,7 +16,7 @@ def _ensure(pkg):
             stdout=subprocess.DEVNULL,
         )
 
-for _p in ["streamlit", "yfinance", "pandas", "numpy", "requests"]:
+for _p in ["streamlit", "yfinance", "pandas", "numpy", "requests", "plotly"]:
     _ensure(_p)
 
 import streamlit as st
@@ -24,6 +24,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from pandas.io.formats.style import Styler
 
@@ -95,27 +96,64 @@ def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def fetch_options_pcr(symbol: str):
-    """Return (pcr, label, color) or (None, None, None) if no options data."""
+def fetch_gamma_wall(symbol: str):
+    """Fetch nearest-expiry option chain; return gamma wall dict or None."""
     try:
         ticker = yf.Ticker(symbol)
         expirations = ticker.options
         if not expirations:
-            return None, None, None
-        chain = ticker.option_chain(expirations[0])
-        put_oi = chain.puts["openInterest"].sum()
-        call_oi = chain.calls["openInterest"].sum()
-        if call_oi == 0:
-            return None, None, None
-        pcr = round(put_oi / call_oi, 3)
-        if pcr > 1.2:
-            return pcr, "看跌情绪重 🔴", "#cc0000"
-        elif pcr < 0.7:
-            return pcr, "看涨情绪重 🟢", "#006600"
-        else:
-            return pcr, "情绪中性 ⚪", "#555555"
+            return None
+        expiry = expirations[0]
+        chain  = ticker.option_chain(expiry)
+
+        # Current price
+        try:
+            price = float(ticker.fast_info.last_price)
+        except Exception:
+            price = float(ticker.history(period="1d")["Close"].iloc[-1])
+        if not price or price <= 0:
+            return None
+
+        calls = chain.calls[["strike", "openInterest"]].rename(columns={"openInterest": "call_oi"})
+        puts  = chain.puts[["strike", "openInterest"]].rename(columns={"openInterest": "put_oi"})
+
+        # Keep ±25 % band around current price for a readable chart
+        lo, hi = price * 0.75, price * 1.25
+        calls = calls[(calls["strike"] >= lo) & (calls["strike"] <= hi)].copy()
+        puts  = puts[(puts["strike"] >= lo) & (puts["strike"] <= hi)].copy()
+
+        # PCR over filtered range
+        call_oi_sum = calls["call_oi"].sum()
+        put_oi_sum  = puts["put_oi"].sum()
+        pcr = round(put_oi_sum / call_oi_sum, 3) if call_oi_sum > 0 else None
+
+        # Top-3 call walls above price, top-3 put walls below price
+        call_above = calls[calls["strike"] > price].nlargest(3, "call_oi")
+        put_below  = puts[puts["strike"] < price].nlargest(3, "put_oi")
+
+        # Nearest level from each top-3 group
+        nearest_call = call_above.sort_values("strike")["strike"].iloc[0] if not call_above.empty else None
+        nearest_put  = put_below.sort_values("strike", ascending=False)["strike"].iloc[0] if not put_below.empty else None
+
+        merged = (
+            pd.merge(calls, puts, on="strike", how="outer")
+            .fillna(0)
+            .sort_values("strike")
+            .reset_index(drop=True)
+        )
+
+        return {
+            "expiry":       expiry,
+            "price":        price,
+            "merged":       merged,
+            "call_walls":   sorted(call_above["strike"].tolist()),
+            "put_walls":    sorted(put_below["strike"].tolist(), reverse=True),
+            "nearest_call": nearest_call,
+            "nearest_put":  nearest_put,
+            "pcr":          pcr,
+        }
     except Exception:
-        return None, None, None
+        return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -384,19 +422,27 @@ for sym in SYMBOLS:
         st.divider()
         continue
 
-    # ── indicators table + options sentiment ──────────────────────────────
-    pcr_val, pcr_label, pcr_color = fetch_options_pcr(sym)
+    # ── indicators table + PCR card ───────────────────────────────────────
+    gw = fetch_gamma_wall(sym)
+
     tbl_col, pcr_col = st.columns([8, 2])
     with tbl_col:
         styled = highlight_signals(scan_df)
         st.dataframe(styled, use_container_width=True, hide_index=True)
     with pcr_col:
-        if pcr_val is not None:
+        if gw and gw["pcr"] is not None:
+            pcr = gw["pcr"]
+            if pcr > 1.2:
+                pcr_label, pcr_color = "看跌情绪重 🔴", "#cc0000"
+            elif pcr < 0.7:
+                pcr_label, pcr_color = "看涨情绪重 🟢", "#006600"
+            else:
+                pcr_label, pcr_color = "情绪中性 ⚪", "#555555"
             st.markdown(
                 f"""<div style="border:2px solid {pcr_color}; border-radius:10px;
                     padding:14px; text-align:center; margin-top:6px;">
                     <div style="font-size:11px; color:#888; margin-bottom:4px;">期权情绪 (PCR)</div>
-                    <div style="font-size:30px; font-weight:bold; color:{pcr_color};">{pcr_val}</div>
+                    <div style="font-size:30px; font-weight:bold; color:{pcr_color};">{pcr}</div>
                     <div style="font-size:13px; color:{pcr_color}; margin-top:4px;">{pcr_label}</div>
                     <div style="font-size:10px; color:#aaa; margin-top:6px;">最近到期日数据</div>
                 </div>""",
@@ -411,6 +457,62 @@ for sym in SYMBOLS:
                 </div>""",
                 unsafe_allow_html=True,
             )
+
+    # ── Gamma 墙柱状图 ────────────────────────────────────────────────────
+    if gw:
+        merged = gw["merged"]
+        price  = gw["price"]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=merged["strike"], y=merged["call_oi"],
+            name="Call OI（阻力）",
+            marker_color="rgba(220,50,50,0.75)",
+        ))
+        fig.add_trace(go.Bar(
+            x=merged["strike"], y=merged["put_oi"],
+            name="Put OI（支撑）",
+            marker_color="rgba(50,180,50,0.75)",
+        ))
+
+        # 当前价竖线
+        fig.add_vline(
+            x=price, line_dash="dash", line_color="#ff9900", line_width=2,
+            annotation_text=f"  当前 ${price:.2f}",
+            annotation_font_color="#ff9900",
+            annotation_font_size=12,
+        )
+        # Top-3 Call Wall 参考线（浅红虚线）
+        for s in gw["call_walls"]:
+            fig.add_vline(x=s, line_dash="dot", line_color="rgba(220,50,50,0.35)", line_width=1)
+        # Top-3 Put Wall 参考线（浅绿虚线）
+        for s in gw["put_walls"]:
+            fig.add_vline(x=s, line_dash="dot", line_color="rgba(50,180,50,0.35)", line_width=1)
+
+        fig.update_layout(
+            title=dict(text=f"Gamma 墙分析 — {sym}  （到期日: {gw['expiry']}）", font_size=14),
+            barmode="group",
+            height=320,
+            margin=dict(l=0, r=0, t=45, b=0),
+            legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0),
+            xaxis=dict(title="行权价 ($)", showgrid=True, gridcolor="#eee"),
+            yaxis=dict(title="未平仓量", showgrid=True, gridcolor="#eee"),
+            plot_bgcolor="white",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 文字总结
+        nc  = f"${gw['nearest_call']:.2f}" if gw["nearest_call"] else "—"
+        np_ = f"${gw['nearest_put']:.2f}"  if gw["nearest_put"]  else "—"
+        cw  = " / ".join(f"${s:.2f}" for s in gw["call_walls"]) or "—"
+        pw  = " / ".join(f"${s:.2f}" for s in gw["put_walls"])  or "—"
+        st.markdown(
+            f"<small>📍 当前价 <b>${price:.2f}</b> &nbsp;│&nbsp; "
+            f"🔴 上方最近阻力 (Call Wall) <b>{nc}</b> &nbsp;│&nbsp; "
+            f"🟢 下方最近支撑 (Put Wall) <b>{np_}</b><br>"
+            f"Call Walls (Top3): {cw} &nbsp;&nbsp; Put Walls (Top3): {pw}</small>",
+            unsafe_allow_html=True,
+        )
 
     # ── 60-day price chart with MA reference lines ────────────────────────
     if not raw.empty and len(raw) >= 50:
