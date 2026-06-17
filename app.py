@@ -114,18 +114,21 @@ def fetch_gamma_wall(symbol: str):
         if not price or price <= 0:
             return None
 
-        calls = chain.calls[["strike", "openInterest"]].rename(columns={"openInterest": "call_oi"})
-        puts  = chain.puts[["strike", "openInterest"]].rename(columns={"openInterest": "put_oi"})
+        calls_all = chain.calls[["strike", "openInterest"]].rename(columns={"openInterest": "call_oi"})
+        puts_all  = chain.puts[["strike", "openInterest"]].rename(columns={"openInterest": "put_oi"})
 
-        # Keep ±25 % band around current price for a readable chart
+        # PCR from full chain (all strikes), matches original behaviour
+        call_oi_total = calls_all["call_oi"].sum()
+        put_oi_total  = puts_all["put_oi"].sum()
+        pcr = round(put_oi_total / call_oi_total, 3) if call_oi_total > 0 else None
+
+        # Filter to ±25 % band for a readable chart (needs a valid price)
+        import math
+        if math.isnan(price) or price <= 0:
+            return None
         lo, hi = price * 0.75, price * 1.25
-        calls = calls[(calls["strike"] >= lo) & (calls["strike"] <= hi)].copy()
-        puts  = puts[(puts["strike"] >= lo) & (puts["strike"] <= hi)].copy()
-
-        # PCR over filtered range
-        call_oi_sum = calls["call_oi"].sum()
-        put_oi_sum  = puts["put_oi"].sum()
-        pcr = round(put_oi_sum / call_oi_sum, 3) if call_oi_sum > 0 else None
+        calls = calls_all[(calls_all["strike"] >= lo) & (calls_all["strike"] <= hi)].copy()
+        puts  = puts_all[(puts_all["strike"] >= lo) & (puts_all["strike"] <= hi)].copy()
 
         # Top-3 call walls above price, top-3 put walls below price
         call_above = calls[calls["strike"] > price].nlargest(3, "call_oi")
@@ -501,18 +504,17 @@ for sym in SYMBOLS:
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        # 文字总结
+        # 文字总结（纯 Markdown，无 HTML 标签）
         nc  = f"${gw['nearest_call']:.2f}" if gw["nearest_call"] else "—"
         np_ = f"${gw['nearest_put']:.2f}"  if gw["nearest_put"]  else "—"
         cw  = " / ".join(f"${s:.2f}" for s in gw["call_walls"]) or "—"
         pw  = " / ".join(f"${s:.2f}" for s in gw["put_walls"])  or "—"
         st.markdown(
-            f"<small>📍 当前价 <b>${price:.2f}</b> &nbsp;│&nbsp; "
-            f"🔴 上方最近阻力 (Call Wall) <b>{nc}</b> &nbsp;│&nbsp; "
-            f"🟢 下方最近支撑 (Put Wall) <b>{np_}</b><br>"
-            f"Call Walls (Top3): {cw} &nbsp;&nbsp; Put Walls (Top3): {pw}</small>",
-            unsafe_allow_html=True,
+            f"📍 当前价 **${price:.2f}**　│　"
+            f"🔴 上方最近阻力 (Call Wall) **{nc}**　│　"
+            f"🟢 下方最近支撑 (Put Wall) **{np_}**"
         )
+        st.caption(f"Call Walls Top3: {cw}　　　Put Walls Top3: {pw}")
 
     # ── 60-day price chart with MA reference lines ────────────────────────
     if not raw.empty and len(raw) >= 50:
