@@ -460,52 +460,50 @@ for sym in SYMBOLS:
 
     # ── Gamma 墙柱状图 ────────────────────────────────────────────────────
     if gw:
-        merged = gw["merged"]
-        price  = gw["price"]
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=merged["strike"], y=merged["call_oi"],
-            name="Call OI（阻力）",
-            marker_color="rgba(220,50,50,0.75)",
-        ))
-        fig.add_trace(go.Bar(
-            x=merged["strike"], y=merged["put_oi"],
-            name="Put OI（支撑）",
-            marker_color="rgba(50,180,50,0.75)",
-        ))
-
-        # 当前价竖线
-        fig.add_vline(
-            x=price, line_dash="dash", line_color="#ff9900", line_width=2,
-            annotation_text=f"  当前 ${price:.2f}",
-            annotation_font_color="#ff9900",
-            annotation_font_size=12,
-        )
-        # Top-3 Call Wall 参考线（浅红虚线）
-        for s in gw["call_walls"]:
-            fig.add_vline(x=s, line_dash="dot", line_color="rgba(220,50,50,0.35)", line_width=1)
-        # Top-3 Put Wall 参考线（浅绿虚线）
-        for s in gw["put_walls"]:
-            fig.add_vline(x=s, line_dash="dot", line_color="rgba(50,180,50,0.35)", line_width=1)
-
-        fig.update_layout(
-            title=dict(text=f"Gamma 墙分析 — {sym}  （到期日: {gw['expiry']}）", font_size=14),
-            barmode="group",
-            height=320,
-            margin=dict(l=0, r=0, t=45, b=0),
-            legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0),
-            xaxis=dict(title="行权价 ($)", showgrid=True, gridcolor="#eee"),
-            yaxis=dict(title="未平仓量", showgrid=True, gridcolor="#eee"),
-            plot_bgcolor="white",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # 文字总结（纯 Markdown，无 HTML 标签）
+        price = gw["price"]
         nc  = f"${gw['nearest_call']:.2f}" if gw["nearest_call"] else "—"
         np_ = f"${gw['nearest_put']:.2f}"  if gw["nearest_put"]  else "—"
         cw  = " / ".join(f"${s:.2f}" for s in gw["call_walls"]) or "—"
         pw  = " / ".join(f"${s:.2f}" for s in gw["put_walls"])  or "—"
+
+        try:
+            merged = gw["merged"]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=merged["strike"], y=merged["call_oi"],
+                name="Call OI（阻力）",
+                marker_color="rgba(220,50,50,0.75)",
+            ))
+            fig.add_trace(go.Bar(
+                x=merged["strike"], y=merged["put_oi"],
+                name="Put OI（支撑）",
+                marker_color="rgba(50,180,50,0.75)",
+            ))
+            fig.add_vline(
+                x=price, line_dash="dash", line_color="#ff9900", line_width=2,
+                annotation_text=f"  当前 ${price:.2f}",
+                annotation_font_color="#ff9900",
+                annotation_font_size=12,
+            )
+            for s in gw["call_walls"]:
+                fig.add_vline(x=s, line_dash="dot", line_color="rgba(220,50,50,0.35)", line_width=1)
+            for s in gw["put_walls"]:
+                fig.add_vline(x=s, line_dash="dot", line_color="rgba(50,180,50,0.35)", line_width=1)
+            fig.update_layout(
+                title=dict(text=f"Gamma 墙分析 — {sym}  （到期日: {gw['expiry']}）", font_size=14),
+                barmode="group",
+                height=320,
+                margin=dict(l=0, r=0, t=45, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0),
+                xaxis=dict(title="行权价 ($)", showgrid=True, gridcolor="#eee"),
+                yaxis=dict(title="未平仓量", showgrid=True, gridcolor="#eee"),
+                plot_bgcolor="white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.warning(f"图表加载失败（{e}），显示文字版：")
+
+        # 文字总结 — 图表正常或回退时都显示
         st.markdown(
             f"📍 当前价 **${price:.2f}**　│　"
             f"🔴 上方最近阻力 (Call Wall) **{nc}**　│　"
