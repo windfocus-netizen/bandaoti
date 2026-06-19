@@ -4,6 +4,7 @@ Stock Scanner — Streamlit Web App
 Run: streamlit run app.py
 """
 
+import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,14 +24,12 @@ except ImportError:
     class YFRateLimitError(Exception):
         pass
 
-# Propagate the Streamlit ScriptRunContext into worker threads so that
-# @st.cache_data calls work (and don't spam "missing ScriptRunContext").
 try:
     from streamlit.runtime.scriptrunner import (
         add_script_run_ctx as _add_ctx,
         get_script_run_ctx as _get_ctx,
     )
-except Exception:  # pragma: no cover — very old/new Streamlit
+except Exception:
     _add_ctx = None
 
     def _get_ctx():
@@ -40,24 +39,17 @@ except Exception:  # pragma: no cover — very old/new Streamlit
 
 SYMBOLS = ["MU", "MRVL", "WDC", "SNDK", "AMD", "ASML"]
 
-BLUE_CHIPS = [
-    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO", "TSM", "ORCL",
-    "ASML", "AMD", "MU", "QCOM", "TXN", "ARM", "MRVL", "AMAT", "LRCX", "KLAC",
-    "JPM", "BAC", "GS", "MS", "WFC", "BRK-B", "V", "MA",
-    "UNH", "LLY", "JNJ", "ABBV",
-    "XOM", "CVX",
-    "WMT", "COST", "HD",
-    "GE", "CAT", "RTX", "LMT", "GEV", "VRT",
-    "NFLX", "DIS",
-    "WDC", "SNDK", "COIN", "PLTR",
-]
+SCAN_GROUPS = {
+    "🔬 半导体存储": ["MU", "AMD", "ASML", "MRVL", "WDC", "SNDK", "AMAT", "ARM"],
+    "💻 科技龙头":   ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO"],
+    "⚡ AI基础设施": ["GEV", "VRT", "LRCX", "KLAC", "ANET", "ORCL", "CRM"],
+    "🏦 金融消费":   ["JPM", "V", "MA", "WMT", "COST", "HD", "BAC"],
+    "🏥 医药能源":   ["UNH", "LLY", "JNJ", "XOM", "CVX", "CAT", "RTX"],
+    "🚀 热门成长":   ["NFLX", "COIN", "PLTR", "RKLB", "CRWV", "ARM", "UBER"],
+}
 
 SEC_UA = "StockScanner windfocus@gmail.com"
-
-# Concurrency / retry tuning. max_workers kept low to stay under Yahoo limits.
 MAX_WORKERS = 5
-RETRY_ROUNDS = 3                 # total attempts (1 initial + retries), max 3
-BACKOFF = (2, 4, 8)             # exponential back-off (seconds) between rounds
 
 ITEM_DESC = {
     "1.01": "签订重大协议",
@@ -92,7 +84,7 @@ FOMC_2026 = [
     ("Dec  9–10", "2026-12-09"),
 ]
 
-# ── data-layer exceptions ─────────────────────────────────────────────────────
+# ── exceptions ────────────────────────────────────────────────────────────────
 
 
 class DataUnavailable(Exception):
@@ -100,20 +92,14 @@ class DataUnavailable(Exception):
 
 
 class RateLimited(DataUnavailable):
-    """Yahoo Finance throttled the request — worth retrying with back-off."""
+    """Yahoo Finance throttled the request."""
 
 
 # ── concurrency helpers ───────────────────────────────────────────────────────
 
 
 def _parallel_map(fn, items, max_workers=MAX_WORKERS, progress=None, label="加载中"):
-    """Run ``fn(item)`` across a thread pool.
-
-    Returns ``{item: (result, exception_or_None)}``. Never raises: any
-    exception from ``fn`` is captured so a single failing symbol cannot take
-    down the rest of the batch. Updates ``progress`` (a st.progress handle)
-    as futures complete.
-    """
+    """Run fn(item) across a thread pool; returns {item: (result, exc_or_None)}."""
     items = list(items)
     total = len(items)
     results = {}
@@ -127,7 +113,7 @@ def _parallel_map(fn, items, max_workers=MAX_WORKERS, progress=None, label="加�
             _add_ctx(threading.current_thread(), ctx)
         try:
             return item, fn(item), None
-        except Exception as exc:  # noqa: BLE001 — captured per-item on purpose
+        except Exception as exc:
             return item, None, exc
 
     done = 0
@@ -142,7 +128,7 @@ def _parallel_map(fn, items, max_workers=MAX_WORKERS, progress=None, label="加�
     return results
 
 
-# ── perf tracking (shown in sidebar) ──────────────────────────────────────────
+# ── perf tracking ─────────────────────────────────────────────────────────────
 
 
 def _add_fetch(secs: float):
@@ -181,25 +167,37 @@ def calc_kdj(df, n=9, m=3):
     return K, D, J
 
 
-# ── data fetchers (cached) ─────────────────────────────────────────────────────
-# NOTE: on rate-limit / transient failure these RAISE rather than returning an
-# empty value. st.cache_data does not cache exceptions, so a throttled request
-# is never poisoned into the cache — the next attempt re-fetches cleanly. This
-# is what prevents one rate-limit storm from making *all* symbols read
-# "数据不足" for the rest of the TTL window.
+# ── data fetchers ─────────────────────────────────────────────────────────────
+# Tab1 and Tab2 use SEPARATE cache functions so that a rate-limit storm in one
+# never poisons the other's cache. Fetchers raise on failure (exceptions are not
+# cached by st.cache_data, so the next request re-fetches cleanly).
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
-    """Daily OHLCV history. TTL = 15 min. Raises on failure (not cached)."""
+def fetch_tech_data(symbol: str) -> pd.DataFrame:
+    """History for Tab1 technical scan. Cache key is isolated from Tab2."""
     try:
-        df = yf.Ticker(symbol).history(period=period)
+        df = yf.Ticker(symbol).history(period="6mo")
     except YFRateLimitError as exc:
         raise RateLimited(f"{symbol}: rate limited") from exc
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise DataUnavailable(f"{symbol}: {exc}") from exc
     if df.empty:
-        # Empty payloads are usually silent throttling — treat as retryable.
+        raise RateLimited(f"{symbol}: empty history")
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    return df
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_scan_data(symbol: str) -> pd.DataFrame:
+    """History for Tab2 golden-pit scan. Cache key is isolated from Tab1."""
+    try:
+        df = yf.Ticker(symbol).history(period="6mo")
+    except YFRateLimitError as exc:
+        raise RateLimited(f"{symbol}: rate limited") from exc
+    except Exception as exc:
+        raise DataUnavailable(f"{symbol}: {exc}") from exc
+    if df.empty:
         raise RateLimited(f"{symbol}: empty history")
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
@@ -207,11 +205,7 @@ def fetch_history(symbol: str, period: str = "6mo") -> pd.DataFrame:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_gamma_wall(symbol: str):
-    """Option-chain derived PCR + gamma walls. TTL = 30 min.
-
-    Returns a dict on success, ``None`` when the symbol genuinely has no
-    options. Raises RateLimited/DataUnavailable on failure (not cached).
-    """
+    """Option-chain PCR + gamma walls. TTL = 30 min. Raises on failure."""
     import math
     try:
         ticker = yf.Ticker(symbol)
@@ -230,9 +224,8 @@ def fetch_gamma_wall(symbol: str):
 
         call_oi_series = chain.calls["openInterest"].dropna()
         put_oi_series  = chain.puts["openInterest"].dropna()
-
-        call_oi_total = call_oi_series.sum(min_count=1)
-        put_oi_total  = put_oi_series.sum(min_count=1)
+        call_oi_total  = call_oi_series.sum(min_count=1)
+        put_oi_total   = put_oi_series.sum(min_count=1)
 
         if (math.isnan(float(call_oi_total)) or call_oi_total == 0
                 or math.isnan(float(put_oi_total))):
@@ -243,8 +236,6 @@ def fetch_gamma_wall(symbol: str):
         calls_all = chain.calls[["strike", "openInterest"]].rename(columns={"openInterest": "call_oi"})
         puts_all  = chain.puts[["strike", "openInterest"]].rename(columns={"openInterest": "put_oi"})
 
-        if math.isnan(price) or price <= 0:
-            return None
         lo, hi = price * 0.75, price * 1.25
         calls = calls_all[(calls_all["strike"] >= lo) & (calls_all["strike"] <= hi)].copy()
         puts  = puts_all[(puts_all["strike"] >= lo) & (puts_all["strike"] <= hi)].copy()
@@ -261,7 +252,6 @@ def fetch_gamma_wall(symbol: str):
             .sort_values("strike")
             .reset_index(drop=True)
         )
-
         return {
             "expiry":       expiry,
             "price":        price,
@@ -274,13 +264,12 @@ def fetch_gamma_wall(symbol: str):
         }
     except YFRateLimitError as exc:
         raise RateLimited(f"{symbol}: options rate limited") from exc
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise DataUnavailable(f"{symbol}: options {exc}") from exc
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_earnings(symbol: str):
-    """Next earnings date. TTL = 60 min. Raises only on rate limit."""
     try:
         cal = yf.Ticker(symbol).calendar
         if isinstance(cal, dict):
@@ -322,11 +311,10 @@ def fetch_8k_filings(symbol: str, cik: int, days: int = 10) -> list[dict]:
             headers={"User-Agent": SEC_UA},
             timeout=10,
         )
-        recent = r.json().get("filings", {}).get("recent", {})
+        recent     = r.json().get("filings", {}).get("recent", {})
         forms      = recent.get("form", [])
         dates      = recent.get("filingDate", [])
         items_list = recent.get("items", [])
-
         for form, date_str, raw_items in zip(forms, dates, items_list):
             if form not in ("8-K", "8-K/A", "6-K", "6-K/A"):
                 continue
@@ -337,28 +325,76 @@ def fetch_8k_filings(symbol: str, cik: int, days: int = 10) -> list[dict]:
                 for x in str(raw_items).split(",")
                 if x.strip() and x.strip().lower() != "nan"
             ]
-            results.append({
-                "symbol":  symbol,
-                "date":    date_str,
-                "form":    form,
-                "items":   items,
-            })
+            results.append({"symbol": symbol, "date": date_str, "form": form, "items": items})
     except Exception:
         pass
     return results
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_macro_sina() -> dict:
+    """Fetch macro from Sina Finance (5-min cache).
+
+    Returns a dict with parsed data. On any failure returns {"_raw": <text>}
+    so the caller can display the raw response for debugging.
+
+    Field layout (from live inspection):
+      hf_ (futures): vals[0]=现价, vals[7]=昨收
+      gb_ (indices):  vals[1]=现价, vals[2]=涨跌幅%
+    """
+    url = "http://hq.sinajs.cn/list=hf_GC,hf_SI,hf_HG,hf_DX,hf_VIX,gb_$tnx"
+    headers = {"Referer": "https://finance.sina.com.cn/"}
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        response.encoding = "gbk"
+        text = response.text
+    except Exception as exc:
+        return {"_raw": f"请求失败: {exc}"}
+
+    result = {}
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if "hq_str_" not in line:
+            continue
+        try:
+            key = line.split("hq_str_")[1].split("=")[0].strip()
+        except IndexError:
+            continue
+        m = re.search(r'"([^"]*)"', line)
+        if not m or not m.group(1):
+            continue
+        vals = m.group(1).split(",")
+        try:
+            if key.startswith("hf_"):
+                current = float(vals[0])
+                prev    = float(vals[7])
+                change  = current - prev
+                result[key] = {
+                    "current":    current,
+                    "prev":       prev,
+                    "change":     round(change, 4),
+                    "change_pct": round(change / prev * 100 if prev else 0.0, 2),
+                }
+            elif key.startswith("gb_"):
+                result[key] = {
+                    "current":    float(vals[1]),
+                    "change_pct": round(float(vals[2]), 2),
+                }
+        except (ValueError, IndexError):
+            result[key] = {"_parse_error": True, "_raw": ",".join(vals)}
+
+    if not any(k.startswith(("hf_", "gb_")) for k in result):
+        return {"_raw": text}
+    return result
 
 
 # ── analysis ──────────────────────────────────────────────────────────────────
 
 
 def analyze(symbol: str, df: pd.DataFrame | None = None):
-    """Build the 5-row technical table. ``df`` may be a pre-fetched history.
-
-    Returns a DataFrame, or ``None`` when there is genuinely too little
-    history. Propagates DataUnavailable if a fetch is needed and fails.
-    """
+    """Build 5-row technical table. Uses fetch_tech_data when df not provided."""
     if df is None:
-        df = fetch_history(symbol)
+        df = fetch_tech_data(symbol)
     if df is None or df.empty or len(df) < 50:
         return None
 
@@ -486,81 +522,23 @@ def highlight_signals(df: pd.DataFrame) -> Styler:
     return df.style.apply(color_row, axis=1)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_macro_sina() -> dict:
-    """Fetch macro indicators from Sina Finance (5-min cache)."""
-    try:
-        url = "https://hq.sinajs.cn/list=hf_GC,hf_SI,hf_HG,hf_DX,hf_VIX,gb_%24tnx"
-        headers = {
-            "Referer": "https://finance.sina.com.cn/",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-        }
-        r = requests.get(url, headers=headers, timeout=10)
-        r.encoding = "gbk"
-        result = {}
-        for line in r.text.strip().split("\n"):
-            if '="' not in line:
-                continue
-            key_part, _, val_part = line.partition('="')
-            key = key_part.replace("var hq_str_", "").strip()
-            key = key.replace("%24", "$")  # normalize URL-encoded $
-            val = val_part.rstrip("\n\r").rstrip(";").rstrip('"')
-            fields = val.split(",")
-            if not fields or not fields[0].strip():
-                continue
-            try:
-                if key.startswith("hf_") and len(fields) >= 5:
-                    current = float(fields[0])
-                    prev    = float(fields[4])
-                    change  = current - prev
-                    result[key] = {
-                        "current":    current,
-                        "prev":       prev,
-                        "change":     round(change, 4),
-                        "change_pct": round(change / prev * 100 if prev else 0.0, 2),
-                        "high":       float(fields[1]),
-                        "low":        float(fields[2]),
-                    }
-                elif key.startswith("gb_") and len(fields) >= 5:
-                    result[key] = {
-                        "current":    float(fields[0]),
-                        "high":       float(fields[1]),
-                        "low":        float(fields[2]),
-                        "change":     float(fields[4]),
-                        "change_pct": float(fields[5]) if len(fields) > 5 else 0.0,
-                    }
-            except (ValueError, IndexError):
-                result[key] = None
-        return result
-    except Exception:
-        return {}
-
-
 def scan_one_golden(symbol: str):
-    """Return metrics dict if symbol passes golden-pit criteria, else None.
-
-    Lets RateLimited / DataUnavailable propagate so the orchestrator can
-    retry throttled symbols instead of silently dropping them.
-    """
-    df = fetch_history(symbol)
+    """Golden-pit criteria check. Uses fetch_scan_data (Tab2 cache, not Tab1)."""
+    df = fetch_scan_data(symbol)
     if df.empty or len(df) < 55:
         return None
     df = df[["Close", "High", "Low", "Volume"]].copy()
-    df["MA50"]   = df["Close"].rolling(50).mean()
-    df["RSI"]    = calc_rsi(df["Close"])
-    df["VolMA20"]= df["Volume"].rolling(20).mean()
+    df["MA50"]    = df["Close"].rolling(50).mean()
+    df["RSI"]     = calc_rsi(df["Close"])
+    df["VolMA20"] = df["Volume"].rolling(20).mean()
     _, _, j_series = calc_kdj(df)
     df["J"] = j_series
     clean = df.dropna()
     if len(clean) < 6:
         return None
-    latest  = clean.iloc[-1]
-    price   = latest["Close"]
-    j_val   = latest["J"]
+    latest   = clean.iloc[-1]
+    price    = latest["Close"]
+    j_val    = latest["J"]
     if j_val >= 25 or price <= latest["MA50"]:
         return None
     price_5d = clean["Close"].iloc[-6]
@@ -586,111 +564,48 @@ def highlight_golden_pit(df: pd.DataFrame) -> Styler:
     return df.style.apply(color_row, axis=1)
 
 
-# ── orchestration (concurrent fetch + rate-limit retry rounds) ─────────────────
+# ── Tab1 bundle loader (no retries, no sleep) ──────────────────────────────────
 
 
-def _load_bundle(symbol: str, want_options: bool) -> dict:
-    """Fetch everything Tab1 needs for one symbol, isolating each failure."""
-    b = {
-        "hist": None, "hist_err": None,
-        "gamma": None, "gamma_err": None,
-        "earnings": "N/A", "rate_limited": False,
-    }
+def _load_tech_bundle(symbol: str) -> dict:
+    """Fetch Tab1 data for one symbol. Per-symbol failure isolation, no retry."""
+    b = {"hist": None, "hist_err": None, "gamma": None, "gamma_err": None}
     try:
-        b["hist"] = fetch_history(symbol)
+        b["hist"] = fetch_tech_data(symbol)
     except RateLimited:
-        b["rate_limited"] = True
         b["hist_err"] = "ratelimit"
     except DataUnavailable as exc:
         b["hist_err"] = str(exc)
 
-    if want_options:
-        try:
-            b["gamma"] = fetch_gamma_wall(symbol)
-        except RateLimited:
-            b["rate_limited"] = True
-            b["gamma_err"] = "ratelimit"
-        except DataUnavailable as exc:
-            b["gamma_err"] = str(exc)
-
     try:
-        b["earnings"] = fetch_earnings(symbol)
-    except (RateLimited, DataUnavailable):
-        b["rate_limited"] = True
-        b["earnings"] = "加载中"
+        b["gamma"] = fetch_gamma_wall(symbol)
+    except (RateLimited, DataUnavailable) as exc:
+        b["gamma_err"] = str(exc)
     return b
 
 
-def warm_symbols(symbols, want_options=True, progress=None, status=None,
-                 max_workers=MAX_WORKERS) -> dict:
-    """Concurrently load Tab1 bundles, retrying only the throttled symbols.
+# ── Tab2 sequential group scanner ─────────────────────────────────────────────
 
-    Retries up to RETRY_ROUNDS times with exponential back-off. Anything that
-    already succeeded is served from cache on the retry round, so retries are
-    cheap. Shows a live "限速中，将在X秒后重试" message via ``status``.
+
+def scan_group_sequential(symbols: list, prog) -> list:
+    """Sequential golden-pit scan with sleep(1) between requests.
+
+    ``prog`` is a st.progress handle. Clears itself when done.
+    Each symbol's failure is isolated; only matched results are returned.
     """
-    bundles = {}
-    pending = list(symbols)
-    for attempt in range(RETRY_ROUNDS):
-        out = _parallel_map(
-            lambda s: _load_bundle(s, want_options),
-            pending, max_workers=max_workers, progress=progress,
-            label=f"加载技术数据 (第{attempt + 1}轮)",
-        )
-        retry = []
-        for sym, (res, err) in out.items():
-            if err is not None or res is None:
-                bundles[sym] = {
-                    "hist": None, "hist_err": str(err), "gamma": None,
-                    "gamma_err": None, "earnings": "N/A", "rate_limited": False,
-                }
-                continue
-            bundles[sym] = res
-            if res.get("rate_limited"):
-                retry.append(sym)
-        if not retry or attempt == RETRY_ROUNDS - 1:
-            break
-        delay = BACKOFF[attempt]
-        if status is not None:
-            status.warning(
-                f"⚠️ Yahoo Finance 限速中，将在 {delay} 秒后重试"
-                f"（{len(retry)} 只待重试）..."
-            )
-        time.sleep(delay)
-        pending = retry
-    if status is not None:
-        status.empty()
-    return bundles
-
-
-def run_golden_scan(symbols, progress=None, status=None, max_workers=MAX_WORKERS):
-    """Concurrent golden-pit scan with rate-limit retry rounds."""
     found = []
-    pending = list(symbols)
-    for attempt in range(RETRY_ROUNDS):
-        out = _parallel_map(
-            scan_one_golden, pending, max_workers=max_workers, progress=progress,
-            label=f"黄金坑扫描 (第{attempt + 1}轮)",
-        )
-        retry = []
-        for sym, (res, err) in out.items():
-            if isinstance(err, RateLimited):
-                retry.append(sym)
-            elif err is None and res:
-                found.append(res)
-            # else: no match, or non-retryable DataUnavailable → skip
-        if not retry or attempt == RETRY_ROUNDS - 1:
-            break
-        delay = BACKOFF[attempt]
-        if status is not None:
-            status.warning(
-                f"⚠️ Yahoo Finance 限速中，将在 {delay} 秒后重试"
-                f"（{len(retry)} 只待重试）..."
-            )
-        time.sleep(delay)
-        pending = retry
-    if status is not None:
-        status.empty()
+    total = len(symbols)
+    for i, sym in enumerate(symbols):
+        prog.progress((i + 1) / total, text=f"扫描 {sym}... ({i+1}/{total})")
+        try:
+            r = scan_one_golden(sym)
+            if r:
+                found.append(r)
+        except Exception:
+            pass
+        if i < total - 1:
+            time.sleep(1)
+    prog.empty()
     return found
 
 
@@ -702,7 +617,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Per-run fetch timer reset; last-refresh persists across reruns.
 st.session_state["_fetch_secs"] = 0.0
 st.session_state.setdefault("_last_refresh", "—")
 
@@ -737,7 +651,7 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    perf_ph = st.empty()  # filled at end of script with refresh time + duration
+    perf_ph = st.empty()
 
 # ── main page ─────────────────────────────────────────────────────────────────
 
@@ -748,7 +662,7 @@ st.info("💡 如遇数据加载失败，请等待30秒后点击侧边栏「刷�
 tab1, tab2, tab3 = st.tabs(["📊 技术扫描", "🎯 黄金坑", "🌍 宏观"])
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab1 — 技术扫描
+# Tab1 — 技术扫描（独立，不受黄金坑扫描影响）
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab1:
@@ -792,20 +706,25 @@ with tab1:
     st.divider()
     st.header("技术指标 & 60天走势")
 
-    # ── concurrent load of all 6 symbols (history + options + earnings) ──────
-    _prog   = st.progress(0.0, text="加载技术指标数据...")
-    _status = st.empty()
+    # Concurrent load of 6 symbols — no sleep, no retry, per-symbol isolation
+    _prog = st.progress(0.0, text="加载技术指标数据...")
     _t0 = time.perf_counter()
-    bundles = warm_symbols(SYMBOLS, want_options=True, progress=_prog,
-                           status=_status, max_workers=MAX_WORKERS)
+    tech_out = _parallel_map(
+        _load_tech_bundle, SYMBOLS,
+        max_workers=MAX_WORKERS, progress=_prog, label="加载数据",
+    )
     _prog.empty()
     _add_fetch(time.perf_counter() - _t0)
 
     for sym in SYMBOLS:
-        b = bundles.get(sym, {})
+        res, err = tech_out.get(sym, (None, None))
+        b = res if res is not None else {
+            "hist": None, "hist_err": str(err),
+            "gamma": None, "gamma_err": None,
+        }
         st.subheader(sym)
 
-        if b.get("hist") is None:
+        if b["hist"] is None:
             st.warning("⚠️ 该股票数据暂不可用（Yahoo Finance 限速或网络问题），其他股票不受影响。")
             st.divider()
             continue
@@ -817,7 +736,7 @@ with tab1:
             continue
 
         gw         = b.get("gamma")
-        gw_pending = b.get("gamma_err") is not None  # failed/throttled, not "no options"
+        gw_pending = b.get("gamma_err") is not None
         raw        = b["hist"]
 
         tbl_col, pcr_col = st.columns([8, 2])
@@ -843,12 +762,7 @@ with tab1:
                     unsafe_allow_html=True,
                 )
             else:
-                if gw_pending:
-                    msg = "数据加载中..."
-                elif gw is None:
-                    msg = "无期权数据"
-                else:
-                    msg = "数据不足"
+                msg = "数据加载中..." if gw_pending else ("无期权数据" if gw is None else "数据不足")
                 st.markdown(
                     f"""<div style="border:1px solid #ddd; border-radius:10px;
                         padding:14px; text-align:center; margin-top:6px; color:#aaa;">
@@ -952,30 +866,34 @@ with tab1:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab2 — 黄金坑
+# Tab2 — 黄金坑（分组扫描，按钮触发，与Tab1完全隔离）
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab2:
     st.header("🎯 黄金坑扫描")
-    st.markdown(
-        "**筛选条件:** J值 < 25 　·　 价格在MA50上方 　·　 近5日涨跌幅 < −3%  \n"
-        f"**股票池:** {len(BLUE_CHIPS)} 只大市值蓝筹（纳指100 + 标普500）"
+    st.markdown("**筛选条件:** J值 < 25 　·　 价格在MA50上方 　·　 近5日涨跌幅 < −3%")
+
+    group_name = st.selectbox(
+        "选择扫描组",
+        list(SCAN_GROUPS.keys()),
+        key="scan_group",
     )
+    group_symbols = SCAN_GROUPS[group_name]
+    st.caption(f"当前组 ({len(group_symbols)} 只): {' · '.join(group_symbols)}")
 
     if st.button("🚀 开始扫描", key="btn_golden"):
-        prog   = st.progress(0.0, text="初始化...")
-        status = st.empty()
+        prog = st.progress(0.0, text="初始化...")
         t0 = time.perf_counter()
-        found = run_golden_scan(BLUE_CHIPS, progress=prog, status=status,
-                                max_workers=MAX_WORKERS)
-        prog.empty()
+        found = scan_group_sequential(group_symbols, prog)
         _add_fetch(time.perf_counter() - t0)
-        st.session_state["pit_results"]   = found
-        st.session_state["pit_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.session_state["pit_results"]    = found
+        st.session_state["pit_scan_time"]  = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.session_state["pit_scan_group"] = group_name
 
     if "pit_results" in st.session_state:
         pit_results = st.session_state["pit_results"]
         scan_time   = st.session_state.get("pit_scan_time", "")
+        scan_group  = st.session_state.get("pit_scan_group", "")
         if pit_results:
             result_df = (
                 pd.DataFrame(pit_results)
@@ -983,7 +901,7 @@ with tab2:
                 .reset_index(drop=True)
             )
             st.caption(
-                f"扫描时间: {scan_time}　　"
+                f"扫描组: {scan_group}　　扫描时间: {scan_time}　　"
                 f"找到 **{len(pit_results)}** 只符合条件　　"
                 f"🔴 红色行 = J值<15 强烈信号"
             )
@@ -996,13 +914,13 @@ with tab2:
             st.dataframe(styled, use_container_width=True, hide_index=True)
         else:
             st.info(
-                f"扫描时间: {scan_time}\n\n"
+                f"扫描组: {scan_group}　　扫描时间: {scan_time}\n\n"
                 "当前没有符合黄金坑条件的股票（J<25 且 价格在MA50上方 且 近5日涨跌<−3%）"
             )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Tab3 — 宏观
+# Tab3 — 宏观（新浪接口，独立加载）
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab3:
@@ -1019,11 +937,16 @@ with tab3:
     _add_fetch(time.perf_counter() - _t0)
     _prog_m.empty()
 
-    if not macro:
+    # Error case: display raw response for debugging
+    if "_raw" in macro and not any(k.startswith(("hf_", "gb_")) for k in macro):
+        st.error("宏观数据解析失败，原始返回内容：")
+        st.code(macro.get("_raw", "（空）"), language=None)
+    elif not macro:
         st.error("无法获取宏观数据，请检查网络或稍后重试。")
     else:
         def _m(key: str) -> dict:
-            return macro.get(key) or {}
+            v = macro.get(key)
+            return v if isinstance(v, dict) and "_parse_error" not in v else {}
 
         gold   = _m("hf_GC")
         silver = _m("hf_SI")
@@ -1118,7 +1041,7 @@ with tab3:
                 st.metric(
                     "📊 10年美债收益率",
                     f"{tnx['current']:.3f}%",
-                    delta=f"{tnx['change']:+.3f}%  ({tnx['change_pct']:+.2f}%)",
+                    delta=f"{tnx['change_pct']:+.2f}%",
                 )
             else:
                 st.metric("📊 10年美债", "—")
@@ -1136,11 +1059,11 @@ with tab3:
 
         with c8:
             if copper and gold and gold.get("current", 0) > 0:
-                cg_ratio = copper["current"] / gold["current"]
+                cg_ratio = copper["current"] / gold["current"] * 1000
                 st.metric(
-                    "🔶/🥇 铜金比",
-                    f"{cg_ratio:.5f}",
-                    help="Copper($/lb) ÷ Gold($/oz)。比值上升通常预示经济扩张",
+                    "🔶/🥇 铜金比 (×1000)",
+                    f"{cg_ratio:.3f}",
+                    help="Copper($/lb) ÷ Gold($/oz) × 1000。比值上升通常预示经济扩张",
                 )
             else:
                 st.metric("🔶/🥇 铜金比", "—")
@@ -1148,20 +1071,20 @@ with tab3:
         # ── Gold detail box ───────────────────────────────────────────────────
         if gold:
             st.divider()
-            st.subheader("🥇 黄金详情（现货参考）")
+            st.subheader("🥇 黄金详情（期货参考）")
             g1, g2, g3, g4 = st.columns(4)
             with g1:
-                st.metric("当前价", f"${gold['current']:.2f}")
+                st.metric("现价", f"${gold['current']:.2f}")
             with g2:
                 arrow = "▲" if gold["change"] >= 0 else "▼"
-                st.metric("今日涨跌", f"{arrow} ${abs(gold['change']):.2f}")
+                st.metric("涨跌", f"{arrow} ${abs(gold['change']):.2f}")
             with g3:
-                st.metric("今日涨跌%", f"{gold['change_pct']:+.2f}%")
+                st.metric("涨跌%", f"{gold['change_pct']:+.2f}%")
             with g4:
-                st.metric("日内区间", f"${gold['low']:.2f} – ${gold['high']:.2f}")
+                st.metric("昨收", f"${gold['prev']:.2f}")
 
 
-# ── sidebar perf line (filled after all tabs have fetched this run) ────────────
+# ── sidebar perf line ──────────────────────────────────────────────────────────
 
 perf_ph.caption(
     f"上次刷新：{st.session_state.get('_last_refresh', '—')} | "
