@@ -400,6 +400,25 @@ with st.sidebar:
         st.markdown(f"**{sym}** → {ed}")
 
     st.divider()
+    st.header("🚀 待上市新股监控")
+
+    with st.expander("SK海力士 ADR（SK Hynix）"):
+        st.markdown("**预计上市：** 2026年7月中旬（最早7月，原定8月）")
+        st.markdown("**交易所：** 纳斯达克")
+        st.markdown("**关注点：** 英伟达最大HBM供应商，与MU直接竞争")
+        st.markdown("**状态：** 等待SEC最终批准")
+        st.caption("⚠️ 提醒：新股首日上市通常波动剧烈，历史上追高首日的散户大概率被套，建议等待至少1-3个月观察")
+
+    with st.expander("Anthropic（Claude母公司）"):
+        st.markdown("**预计上市：** 2026年10月")
+        st.markdown("**交易所：** 纳斯达克")
+        st.markdown("**估值：** 约9650亿美元")
+        st.markdown("**状态：** 已提交保密IPO文件（6月1日）")
+        st.caption("⚠️ 提醒：新股首日上市通常波动剧烈，历史上追高首日的散户大概率被套，建议等待至少1-3个月观察")
+
+    # 预留空位：可在此添加更多待上市标的
+
+    st.divider()
     st.caption(f"数据刷新时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
     if st.button("🔄 刷新数据"):
         st.cache_data.clear()
