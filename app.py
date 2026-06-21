@@ -84,6 +84,24 @@ FOMC_2026 = [
     ("Dec  9–10", "2026-12-09"),
 ]
 
+DANGER_KEYWORDS = [
+    "guidance cut", "lowered guidance", "下调指引",
+    "inventory buildup", "excess inventory", "库存积压",
+    "demand weakness", "softening demand", "需求走弱",
+    "missed estimates", "below expectations", "不及预期",
+    "production halt", "停产",
+    "recall", "召回",
+    "investigation", "lawsuit", "调查", "诉讼",
+]
+
+POSITIVE_KEYWORDS = [
+    "price target raised", "上调目标价",
+    "beat estimates", "exceeded expectations", "超预期",
+    "new contract", "new order", "新订单", "新合约",
+    "record revenue", "record quarter", "创纪录",
+    "expansion", "capacity increase", "扩产",
+]
+
 # ── exceptions ────────────────────────────────────────────────────────────────
 
 
@@ -329,6 +347,42 @@ def fetch_8k_filings(symbol: str, cik: int, days: int = 10) -> list[dict]:
     except Exception:
         pass
     return results
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news_health(symbol: str) -> dict:
+    """Scan recent 7-day news headlines for danger/positive keywords.
+
+    Returns {"status": "danger"|"positive"|"neutral", "matches": [{"kw": str, "title": str}]}.
+    Never raises — returns neutral on any error.
+    """
+    try:
+        news = yf.Ticker(symbol).news or []
+        cutoff = time.time() - 7 * 24 * 3600
+        recent_titles = [
+            n.get("title") or n.get("content", {}).get("title", "")
+            for n in news
+            if n.get("providerPublishTime", 0) >= cutoff
+        ]
+        danger_hits, positive_hits = [], []
+        for title in recent_titles:
+            tl = title.lower()
+            for kw in DANGER_KEYWORDS:
+                if kw.lower() in tl:
+                    danger_hits.append({"kw": kw, "title": title})
+                    break
+            else:
+                for kw in POSITIVE_KEYWORDS:
+                    if kw.lower() in tl:
+                        positive_hits.append({"kw": kw, "title": title})
+                        break
+        if danger_hits:
+            return {"status": "danger", "matches": danger_hits}
+        if positive_hits:
+            return {"status": "positive", "matches": positive_hits}
+        return {"status": "neutral", "matches": []}
+    except Exception:
+        return {"status": "neutral", "matches": []}
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -757,6 +811,33 @@ with tab1:
         gw         = b.get("gamma")
         gw_pending = b.get("gamma_err") is not None
         raw        = b["hist"]
+
+        # ── 逻辑健康度警报 ────────────────────────────────────────────────────
+        health = fetch_news_health(sym)
+        if health["status"] == "danger":
+            st.markdown(
+                '<div style="background:#fff0f0;border-left:4px solid #cc0000;'
+                'padding:10px 14px;border-radius:4px;margin-bottom:8px;">'
+                '<b style="color:#cc0000;">⚠️ 逻辑健康度：检测到风险信号</b></div>',
+                unsafe_allow_html=True,
+            )
+            for m in health["matches"]:
+                st.caption(f"🔴 触发词「{m['kw']}」— {m['title']}")
+        elif health["status"] == "positive":
+            st.markdown(
+                '<div style="background:#f0fff4;border-left:4px solid #006600;'
+                'padding:10px 14px;border-radius:4px;margin-bottom:8px;">'
+                '<b style="color:#006600;">✅ 逻辑健康度：积极信号</b></div>',
+                unsafe_allow_html=True,
+            )
+            for m in health["matches"]:
+                st.caption(f"🟢 触发词「{m['kw']}」— {m['title']}")
+        else:
+            st.markdown(
+                '<div style="color:#888;font-size:13px;margin-bottom:8px;">'
+                '➖ 逻辑健康度：无明显变化</div>',
+                unsafe_allow_html=True,
+            )
 
         tbl_col, pcr_col = st.columns([8, 2])
         with tbl_col:
