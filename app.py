@@ -39,13 +39,15 @@ except Exception:
 
 SYMBOLS = ["MU", "MRVL", "WDC", "SNDK", "AMD", "ASML"]
 
+GOLDEN_PIT_BLACKLIST = {"CRWV", "COIN", "CRM"}  # 回测表现最差，排除出黄金坑扫描
+
 SCAN_GROUPS = {
     "🔬 半导体存储": ["MU", "AMD", "ASML", "MRVL", "WDC", "SNDK", "AMAT", "ARM"],
     "💻 科技龙头":   ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO"],
-    "⚡ AI基础设施": ["GEV", "VRT", "LRCX", "KLAC", "ANET", "ORCL", "CRM"],
+    "⚡ AI基础设施": ["GEV", "VRT", "LRCX", "KLAC", "ANET", "ORCL"],
     "🏦 金融消费":   ["JPM", "V", "MA", "WMT", "COST", "HD", "BAC"],
     "🏥 医药能源":   ["UNH", "LLY", "JNJ", "XOM", "CVX", "CAT", "RTX"],
-    "🚀 热门成长":   ["NFLX", "COIN", "PLTR", "RKLB", "CRWV", "ARM", "UBER"],
+    "🚀 热门成长":   ["NFLX", "PLTR", "RKLB", "ARM", "UBER"],
 }
 
 SEC_UA = "StockScanner windfocus@gmail.com"
@@ -578,6 +580,8 @@ def highlight_signals(df: pd.DataFrame) -> Styler:
 
 def scan_one_golden(symbol: str):
     """Golden-pit criteria check. Uses fetch_scan_data (Tab2 cache, not Tab1)."""
+    if symbol in GOLDEN_PIT_BLACKLIST:
+        return None
     df = fetch_scan_data(symbol)
     if df.empty or len(df) < 55:
         return None
