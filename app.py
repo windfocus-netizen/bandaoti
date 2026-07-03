@@ -4,6 +4,7 @@ Stock Scanner — Streamlit Web App
 Run: streamlit run app.py
 """
 
+import json
 import re
 import time
 import threading
@@ -37,9 +38,11 @@ except Exception:
 
 # ── constants ────────────────────────────────────────────────────────────────
 
-SYMBOLS = ["MU", "MRVL", "WDC", "SNDK", "AMD", "ASML"]
+DEFAULT_SYMBOLS = ["MU", "MRVL", "WDC", "SNDK", "AMD", "ASML"]  # session_state["symbols"] 的初始值
 
 GOLDEN_PIT_BLACKLIST = {"CRWV", "COIN", "CRM"}  # 回测表现最差，排除出黄金坑扫描
+
+J_STATS_PATH = "D:/trading/golden_pit_j_stats.json"  # 由 backtest_golden_pit.py 生成
 
 SCAN_GROUPS = {
     "🔬 半导体存储": ["MU", "AMD", "ASML", "MRVL", "WDC", "SNDK", "AMAT", "ARM"],
@@ -444,6 +447,41 @@ def fetch_macro_sina() -> dict:
     return result
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_vix_tnx_yf() -> dict:
+    """VIX / 10年美债收益率 / 美元指数的 yfinance 备用数据源。
+
+    新浪的 hf_VIX、gb_$tnx、hf_DX 经常返回空值——这三个都是指数而不是真正的
+    期货合约，新浪的海外期货(hf_)接口本来就不一定覆盖。
+    用 yfinance 的 ^VIX / ^TNX / DX-Y.NYB 兜底。
+    """
+    result = {}
+    for key, ysym in [("VIX", "^VIX"), ("TNX", "^TNX"), ("DXY", "DX-Y.NYB")]:
+        try:
+            hist = yf.Ticker(ysym).history(period="5d")
+            if hist.empty:
+                continue
+            current = float(hist["Close"].iloc[-1])
+            prev    = float(hist["Close"].iloc[-2]) if len(hist) >= 2 else current
+            change  = current - prev
+            result[key] = {
+                "current":    current,
+                "change":     round(change, 4),
+                "change_pct": round(change / prev * 100 if prev else 0.0, 2),
+            }
+        except Exception:
+            continue
+    return result
+
+
+def get_vix_current() -> float | None:
+    """VIX 现价：优先新浪，为空时用 yfinance 兜底。供情绪拐点雷达使用。"""
+    sina_vix = fetch_macro_sina().get("hf_VIX", {})
+    if isinstance(sina_vix, dict) and "current" in sina_vix:
+        return sina_vix["current"]
+    return fetch_vix_tnx_yf().get("VIX", {}).get("current")
+
+
 # ── analysis ──────────────────────────────────────────────────────────────────
 
 
@@ -578,6 +616,35 @@ def highlight_signals(df: pd.DataFrame) -> Styler:
     return df.style.apply(color_row, axis=1)
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_j_stats() -> dict:
+    """加载 backtest_golden_pit.py 生成的 J值分层历史胜率表。文件不存在时返回空字典。"""
+    try:
+        with open(J_STATS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f).get("buckets", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def lookup_j_winrate(j_val: float, horizon: int = 20) -> tuple[str | None, str | None]:
+    """根据 J 值返回其所在分层在指定持有期的历史胜率/平均收益（字符串，找不到则为 None）。"""
+    buckets = load_j_stats()
+    if not buckets:
+        return None, None
+    if j_val < 5:
+        label = "J<5"
+    elif j_val < 15:
+        label = "J 5-15"
+    elif j_val < 25:
+        label = "J 15-25"
+    else:
+        label = "J>=25"
+    hs = buckets.get(label, {}).get("horizons", {}).get(str(horizon))
+    if not hs:
+        return None, None
+    return f"{hs['win_rate']:.0f}%", f"{hs['avg_ret']:+.1f}%"
+
+
 def scan_one_golden(symbol: str):
     """Golden-pit criteria check. Uses fetch_scan_data (Tab2 cache, not Tab1)."""
     if symbol in GOLDEN_PIT_BLACKLIST:
@@ -604,13 +671,16 @@ def scan_one_golden(symbol: str):
     if ret_5d >= -3.0:
         return None
     vol_status = "放量 🔥" if latest["Volume"] > latest["VolMA20"] * 1.5 else "正常"
+    win_rate_20d, avg_ret_20d = lookup_j_winrate(j_val, horizon=20)
     return {
-        "代码":       symbol,
-        "现价":       round(price, 2),
-        "J值":        round(j_val, 1),
-        "近5日涨跌%": round(ret_5d, 2),
-        "RSI":        round(latest["RSI"], 1),
-        "成交量状态": vol_status,
+        "代码":         symbol,
+        "现价":         round(price, 2),
+        "J值":          round(j_val, 1),
+        "近5日涨跌%":   round(ret_5d, 2),
+        "RSI":          round(latest["RSI"], 1),
+        "成交量状态":   vol_status,
+        "历史胜率(20d)": win_rate_20d or "无数据",
+        "历史均收益(20d)": avg_ret_20d or "无数据",
     }
 
 
@@ -620,6 +690,119 @@ def highlight_golden_pit(df: pd.DataFrame) -> Styler:
             return ["background-color: #ffcccc; color: #900; font-weight: bold"] * len(row)
         return [""] * len(row)
     return df.style.apply(color_row, axis=1)
+
+
+# ── 情绪拐点雷达（Tab1 每只股票详情页下方）──────────────────────────────────────
+# PCR/VIX 历史也由独立脚本 collect_daily_mood_data.py 采集写入同一份 CSV，
+# 二者共用同一套 dedup 逻辑，App 不需要开着也能持续积累数据。
+
+PCR_HISTORY_PATH = "D:/trading/pcr_history.csv"   # 列: date, symbol, value（按股票分开）
+VIX_HISTORY_PATH = "D:/trading/vix_history.csv"   # 列: date, value（大盘数据，所有股票共用）
+WATCHLIST_PATH    = "D:/trading/watchlist.json"   # 供 collect_daily_mood_data.py 读取当前监控列表
+
+
+def _sync_watchlist_file(symbols_list: list) -> None:
+    """把当前监控列表写到磁盘，供独立的每日采集脚本读取。不影响页面刷新重置的行为。"""
+    try:
+        with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(
+                {"symbols": symbols_list, "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M")},
+                f, ensure_ascii=False, indent=2,
+            )
+    except OSError:
+        pass
+
+
+def _read_daily_history(path: str) -> pd.DataFrame:
+    """读取无 symbol 列的共用历史（目前用于 VIX）。"""
+    try:
+        return pd.read_csv(path, parse_dates=["date"])
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["date", "value"])
+
+
+def _append_daily_value(path: str, value: float, date_str: str) -> pd.DataFrame:
+    """把今天的数值追加进历史 CSV；同一天重复运行则覆盖当天，不重复追加。"""
+    hist = _read_daily_history(path)
+    if not hist.empty and hist["date"].iloc[-1].strftime("%Y-%m-%d") == date_str:
+        hist.loc[hist.index[-1], "value"] = value
+    else:
+        new_row = pd.DataFrame([{"date": pd.to_datetime(date_str), "value": value}])
+        hist = pd.concat([hist, new_row], ignore_index=True)
+    hist.to_csv(path, index=False)
+    return hist
+
+
+def _read_pcr_history(symbol: str) -> pd.DataFrame:
+    """读取某只股票的 PCR 历史（date, value），按日期排序。"""
+    try:
+        hist = pd.read_csv(PCR_HISTORY_PATH, parse_dates=["date"])
+    except FileNotFoundError:
+        return pd.DataFrame(columns=["date", "value"])
+    return hist[hist["symbol"] == symbol][["date", "value"]].sort_values("date").reset_index(drop=True)
+
+
+def _append_pcr_value(symbol: str, value: float, date_str: str) -> pd.DataFrame:
+    """把某只股票今天的 PCR 追加进共用 CSV；同一股票同一天重复运行则覆盖，不重复追加。"""
+    try:
+        hist = pd.read_csv(PCR_HISTORY_PATH, parse_dates=["date"])
+    except FileNotFoundError:
+        hist = pd.DataFrame(columns=["date", "symbol", "value"])
+    mask_today = (hist["symbol"] == symbol) & (hist["date"].dt.strftime("%Y-%m-%d") == date_str)
+    if mask_today.any():
+        hist.loc[mask_today, "value"] = value
+    else:
+        new_row = pd.DataFrame([{"date": pd.to_datetime(date_str), "symbol": symbol, "value": value}])
+        hist = pd.concat([hist, new_row], ignore_index=True)
+    hist.to_csv(PCR_HISTORY_PATH, index=False)
+    return hist[hist["symbol"] == symbol][["date", "value"]].sort_values("date").reset_index(drop=True)
+
+
+def detect_pcr_cooldown(hist: pd.DataFrame) -> bool:
+    """连续2天较前日下降，且累计降幅超过10%。"""
+    vals = hist["value"].tail(3).tolist()
+    if len(vals) < 3:
+        return False
+    d2, d1, d0 = vals
+    if d1 < d2 and d0 < d1 and d2:
+        return (d2 - d0) / d2 * 100 > 10
+    return False
+
+
+def detect_vix_cooldown(hist: pd.DataFrame) -> bool:
+    """连续2天下降。"""
+    vals = hist["value"].tail(3).tolist()
+    if len(vals) < 3:
+        return False
+    d2, d1, d0 = vals
+    return d1 < d2 and d0 < d1
+
+
+def detect_volume_anomaly(raw: pd.DataFrame, lookback: int = 10) -> bool:
+    """前3天连续成交量>20日均量150%，随后骤降到<70%（地量信号）。"""
+    vol_ma20 = raw["Volume"].rolling(20).mean()
+    ratio = (raw["Volume"] / vol_ma20).dropna()
+    recent = ratio.tail(lookback).tolist()
+    for i in range(3, len(recent)):
+        if recent[i] < 0.70 and all(r > 1.50 for r in recent[i - 3:i]):
+            return True
+    return False
+
+
+def detect_j_recent_low(raw: pd.DataFrame, lookback: int = 20) -> bool:
+    """近 lookback 个交易日内 J 值是否曾跌破 15。"""
+    _, _, j_series = calc_kdj(raw)
+    recent_j = j_series.dropna().tail(lookback)
+    return bool(not recent_j.empty and recent_j.min() < 15)
+
+
+def compute_mood_score(pcr_cool: bool, vix_cool: bool, vol_anomaly: bool, j_recent_low: bool) -> int:
+    score = 0
+    if pcr_cool:      score += 20
+    if vix_cool:      score += 20
+    if vol_anomaly:   score += 30
+    if j_recent_low:  score += 30
+    return score
 
 
 # ── Tab1 bundle loader (no retries, no sleep) ──────────────────────────────────
@@ -677,12 +860,40 @@ st.set_page_config(
 
 st.session_state["_fetch_secs"] = 0.0
 st.session_state.setdefault("_last_refresh", "—")
+st.session_state.setdefault("symbols", DEFAULT_SYMBOLS.copy())
+_sync_watchlist_file(st.session_state["symbols"])  # 每次加载都同步一次，供独立采集脚本使用
 
 today = datetime.today().date()
 
 # ── sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
+    st.header("📌 监控股票管理")
+    with st.form("add_symbol_form", clear_on_submit=True):
+        new_sym_input = st.text_input("添加股票代码", placeholder="如 NVDA")
+        add_submitted = st.form_submit_button("➕ 添加")
+    if add_submitted:
+        new_sym = new_sym_input.strip().upper()
+        if not new_sym:
+            pass
+        elif new_sym in st.session_state["symbols"]:
+            st.warning(f"{new_sym} 已在监控列表中")
+        else:
+            st.session_state["symbols"].append(new_sym)
+            _sync_watchlist_file(st.session_state["symbols"])
+            st.rerun()
+
+    for sym in list(st.session_state["symbols"]):
+        col_sym, col_del = st.columns([4, 1])
+        col_sym.markdown(f"**{sym}**")
+        if col_del.button("🗑️", key=f"del_symbol_{sym}", help=f"移除 {sym}"):
+            st.session_state["symbols"].remove(sym)
+            _sync_watchlist_file(st.session_state["symbols"])
+            st.rerun()
+
+    symbols = st.session_state["symbols"]
+
+    st.divider()
     st.header("📅 2026 FOMC 会议日期")
     for label, date_str in FOMC_2026:
         d = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -695,9 +906,9 @@ with st.sidebar:
     st.divider()
     st.header("📋 下次财报日期")
     _t0 = time.perf_counter()
-    _ed_map = _parallel_map(fetch_earnings, SYMBOLS, max_workers=MAX_WORKERS)
+    _ed_map = _parallel_map(fetch_earnings, symbols, max_workers=MAX_WORKERS)
     _add_fetch(time.perf_counter() - _t0)
-    for sym in SYMBOLS:
+    for sym in symbols:
         _res, _err = _ed_map.get(sym, (None, None))
         ed = _res if (_err is None and _res) else "加载中"
         st.markdown(f"**{sym}** → {ed}")
@@ -735,6 +946,17 @@ with st.sidebar:
 st.title("📈 股票扫描器")
 st.markdown(f"**日期:** {today}")
 st.info("💡 如遇数据加载失败，请等待30秒后点击侧边栏「刷新数据」按钮重试。")
+mood_alert_ph = st.empty()  # 由 Tab1 情绪拐点雷达在算出综合评分后回填
+
+# VIX 是大盘数据，不是个股专属指标，页面级别只拉取/追加一次；
+# Tab1（情绪温度计打分）和 Tab3（大盘情绪温度展示）共用同一份
+_today_str = datetime.now().strftime("%Y-%m-%d")
+_vix_today = get_vix_current()
+vix_hist = (
+    _append_daily_value(VIX_HISTORY_PATH, _vix_today, _today_str)
+    if _vix_today is not None else _read_daily_history(VIX_HISTORY_PATH)
+)
+vix_cool = detect_vix_cooldown(vix_hist)
 
 tab1, tab2, tab3 = st.tabs(["📊 技术扫描", "🎯 黄金坑", "🌍 宏观"])
 
@@ -743,14 +965,14 @@ tab1, tab2, tab3 = st.tabs(["📊 技术扫描", "🎯 黄金坑", "🌍 宏观"
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab1:
-    st.markdown(f"**扫描标的:** {' · '.join(SYMBOLS)}")
+    st.markdown(f"**扫描标的:** {' · '.join(symbols) if symbols else '（监控列表为空，请在侧边栏添加股票）'}")
 
     st.header("📋 重大事件 (8-K / 6-K) — 最近10天")
 
     with st.spinner("正在从 SEC EDGAR 抓取最新文件..."):
         cik_map = fetch_cik_map()
         all_filings = []
-        for sym in SYMBOLS:
+        for sym in symbols:
             cik = cik_map.get(sym)
             if cik:
                 all_filings.extend(fetch_8k_filings(sym, cik, days=10))
@@ -783,17 +1005,19 @@ with tab1:
     st.divider()
     st.header("技术指标 & 60天走势")
 
-    # Concurrent load of 6 symbols — no sleep, no retry, per-symbol isolation
+    # Concurrent load of monitored symbols — no sleep, no retry, per-symbol isolation
     _prog = st.progress(0.0, text="加载技术指标数据...")
     _t0 = time.perf_counter()
     tech_out = _parallel_map(
-        _load_tech_bundle, SYMBOLS,
+        _load_tech_bundle, symbols,
         max_workers=MAX_WORKERS, progress=_prog, label="加载数据",
     )
     _prog.empty()
     _add_fetch(time.perf_counter() - _t0)
 
-    for sym in SYMBOLS:
+    mood_hits = []  # 情绪温度计>60分的股票，循环结束后统一回填到页面顶部横幅
+
+    for sym in symbols:
         res, err = tech_out.get(sym, (None, None))
         b = res if res is not None else {
             "hist": None, "hist_err": str(err),
@@ -966,7 +1190,54 @@ with tab1:
                     delta=f"{(current_price - current_ma50) / current_ma50 * 100:+.1f}%",
                 )
 
+        st.subheader("🌡️ 情绪拐点雷达")
+
+        pcr_today = gw["pcr"] if gw and gw.get("pcr") is not None else None
+        pcr_hist = (
+            _append_pcr_value(sym, pcr_today, _today_str)
+            if pcr_today is not None else _read_pcr_history(sym)
+        )
+
+        pcr_cool     = detect_pcr_cooldown(pcr_hist)
+        vol_anomaly  = detect_volume_anomaly(raw) if not raw.empty else False
+        j_recent_low = detect_j_recent_low(raw) if not raw.empty else False
+        mood_score   = compute_mood_score(pcr_cool, vix_cool, vol_anomaly, j_recent_low)
+
+        col_pcr, col_vol = st.columns(2)
+        with col_pcr:
+            st.caption(f"{sym} PCR 趋势（近30天）")
+            if not pcr_hist.empty:
+                st.line_chart(pcr_hist.set_index("date")["value"].tail(30), use_container_width=True, height=180)
+            else:
+                st.caption("暂无历史数据（期权链无历史API，只能从今天起逐日积累）")
+            if pcr_cool:
+                st.success("🟢 PCR开始降温")
+            else:
+                st.caption("暂无降温信号")
+        with col_vol:
+            st.caption("成交量异常检测")
+            st.metric("最新成交量/20日均量", f"{(raw['Volume'].iloc[-1] / raw['Volume'].rolling(20).mean().iloc[-1] * 100):.0f}%" if not raw.empty else "—")
+            if vol_anomaly:
+                st.error("🔴 可能地量信号，密切关注")
+            else:
+                st.caption("暂无放量转缩量形态")
+
+        st.markdown(
+            f"**{sym} 情绪温度计：{mood_score}/100**　　"
+            f"PCR降温 {'✅+20' if pcr_cool else '➖0'}　"
+            f"VIX降温 {'✅+20' if vix_cool else '➖0'}　"
+            f"缩量企稳 {'✅+30' if vol_anomaly else '➖0'}　"
+            f"J值曾<15 {'✅+30' if j_recent_low else '➖0'}"
+        )
+        st.progress(min(mood_score, 100) / 100)
+
+        if mood_score > 60:
+            mood_hits.append(sym)
+
         st.divider()
+
+    if mood_hits:
+        mood_alert_ph.success(f"🎯 情绪拐点观察窗口：{'、'.join(mood_hits)}，可考虑分批建仓")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1007,8 +1278,12 @@ with tab2:
             st.caption(
                 f"扫描组: {scan_group}　　扫描时间: {scan_time}　　"
                 f"找到 **{len(pit_results)}** 只符合条件　　"
-                f"🔴 红色行 = J值<15 强烈信号"
+                f"🔴 红色行 = J值<15 强烈信号　　"
+                f"历史胜率/均收益 按信号J值所在分层（J<5 / 5-15 / 15-25）取自过去1年回测，"
+                f"20个交易日后的统计（见 backtest_golden_pit.py）"
             )
+            if not load_j_stats():
+                st.warning("尚未生成历史胜率数据，请先运行 `python backtest_golden_pit.py` 生成 golden_pit_j_stats.json")
             styled = highlight_golden_pit(result_df).format({
                 "现价":       "${:.2f}",
                 "J值":        "{:.1f}",
@@ -1058,6 +1333,17 @@ with tab3:
         dxy    = _m("hf_DX")
         vix    = _m("hf_VIX")
         tnx    = _m("gb_$tnx")
+
+        # 新浪的 hf_VIX / gb_$tnx / hf_DX 经常是空的（这三个是指数，不是新浪海外
+        # 期货接口覆盖的真实合约），为空时用 yfinance ^VIX / ^TNX / DX-Y.NYB 兜底
+        if not vix or not tnx or not dxy:
+            _yf_fallback = fetch_vix_tnx_yf()
+            if not vix:
+                vix = _yf_fallback.get("VIX", {})
+            if not tnx:
+                tnx = _yf_fallback.get("TNX", {})
+            if not dxy:
+                dxy = _yf_fallback.get("DXY", {})
 
         # ── Row 1: Commodities + USD ──────────────────────────────────────────
         st.subheader("大宗商品 & 美元指数")
@@ -1171,6 +1457,19 @@ with tab3:
                 )
             else:
                 st.metric("🔶/🥇 铜金比", "—")
+
+        st.divider()
+
+        # ── 大盘情绪温度：VIX 30天走势（全市场统一展示一次，不按个股拆分）──────────
+        st.subheader("🌡️ 大盘情绪温度（VIX 30天走势）")
+        if not vix_hist.empty:
+            st.line_chart(vix_hist.set_index("date")["value"].tail(30), use_container_width=True, height=220)
+        else:
+            st.caption("暂无历史数据，从今天起开始积累")
+        if vix_cool:
+            st.success("🟢 市场恐慌降温（VIX连续2天下降）")
+        else:
+            st.caption("暂无降温信号")
 
         # ── Gold detail box ───────────────────────────────────────────────────
         if gold:
