@@ -5,6 +5,7 @@ Run: streamlit run app.py
 """
 
 import json
+import os
 import re
 import time
 import threading
@@ -42,7 +43,9 @@ DEFAULT_SYMBOLS = ["MU", "MRVL", "WDC", "SNDK", "AMD", "ASML"]  # session_state[
 
 GOLDEN_PIT_BLACKLIST = {"CRWV", "COIN", "CRM"}  # 回测表现最差，排除出黄金坑扫描
 
-J_STATS_PATH = "D:/trading/golden_pit_j_stats.json"  # 由 backtest_golden_pit.py 生成
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+J_STATS_PATH = os.path.join(APP_DIR, "golden_pit_j_stats.json")  # 由 backtest_golden_pit.py 生成
 
 SCAN_GROUPS = {
     "🔬 半导体存储": ["MU", "AMD", "ASML", "MRVL", "WDC", "SNDK", "AMAT", "ARM"],
@@ -696,9 +699,9 @@ def highlight_golden_pit(df: pd.DataFrame) -> Styler:
 # PCR/VIX 历史也由独立脚本 collect_daily_mood_data.py 采集写入同一份 CSV，
 # 二者共用同一套 dedup 逻辑，App 不需要开着也能持续积累数据。
 
-PCR_HISTORY_PATH = "D:/trading/pcr_history.csv"   # 列: date, symbol, value（按股票分开）
-VIX_HISTORY_PATH = "D:/trading/vix_history.csv"   # 列: date, value（大盘数据，所有股票共用）
-WATCHLIST_PATH    = "D:/trading/watchlist.json"   # 供 collect_daily_mood_data.py 读取当前监控列表
+PCR_HISTORY_PATH = os.path.join(APP_DIR, "pcr_history.csv")   # 列: date, symbol, value（按股票分开）
+VIX_HISTORY_PATH = os.path.join(APP_DIR, "vix_history.csv")   # 列: date, value（大盘数据，所有股票共用）
+WATCHLIST_PATH    = os.path.join(APP_DIR, "watchlist.json")   # 供 collect_daily_mood_data.py 读取当前监控列表
 
 
 def _sync_watchlist_file(symbols_list: list) -> None:
