@@ -750,7 +750,7 @@ def _append_pcr_value(symbol: str, value: float, date_str: str) -> pd.DataFrame:
     try:
         hist = pd.read_csv(PCR_HISTORY_PATH, parse_dates=["date"])
     except FileNotFoundError:
-        hist = pd.DataFrame(columns=["date", "symbol", "value"])
+        hist = pd.DataFrame({"date": pd.Series(dtype="datetime64[ns]"), "symbol": pd.Series(dtype="object"), "value": pd.Series(dtype="float64")})
     mask_today = (hist["symbol"] == symbol) & (hist["date"].dt.strftime("%Y-%m-%d") == date_str)
     if mask_today.any():
         hist.loc[mask_today, "value"] = value
